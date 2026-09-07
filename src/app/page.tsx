@@ -1,38 +1,55 @@
 "use client";
 
-import { useState, useRef } from "react";
+import { ChangeEvent, DragEvent, useRef, useState } from "react";
 
-type Claim = {
-  claim: string;
-  category: string;
-  status?: "Verified" | "Inaccurate" | "False" | "Unverifiable";
-  reasoning?: string;
-};
+type ClaimStatus = "Verified" | "Inaccurate" | "False" | "Unverifiable";
+type Claim = { claim: string; category: string; status?: ClaimStatus; reasoning?: string };
+type ProcessStatus = "idle" | "uploading" | "extracting" | "verifying" | "success" | "error";
+
+const stages = [
+  { key: "uploading", label: "Read document" },
+  { key: "extracting", label: "Find claims" },
+  { key: "verifying", label: "Check evidence" },
+];
+
+function getErrorMessage(error: unknown) {
+  return error instanceof Error ? error.message : "Something went wrong while checking this file.";
+}
 
 export default function Home() {
   const [file, setFile] = useState<File | null>(null);
-  const [status, setStatus] = useState<
-    "idle" | "uploading" | "extracting" | "verifying" | "success" | "error"
-  >("idle");
+  const [status, setStatus] = useState<ProcessStatus>("idle");
   const [results, setResults] = useState<Claim[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [isDragging, setIsDragging] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const selectedFile = e.target.files?.[0];
-    if (selectedFile && selectedFile.type === "application/pdf") {
-      setFile(selectedFile);
-      setError(null);
-      setStatus("idle");
-      setResults([]);
-    } else {
-      setError("Please select a valid PDF file.");
+  const chooseFile = (selectedFile?: File) => {
+    if (!selectedFile) return;
+    if (selectedFile.type !== "application/pdf") {
+      setError("Please choose a PDF file.");
+      return;
     }
+    if (selectedFile.size > 10 * 1024 * 1024) {
+      setError("That PDF is larger than 10MB. Choose a smaller file.");
+      return;
+    }
+    setFile(selectedFile);
+    setError(null);
+    setStatus("idle");
+    setResults([]);
+  };
+
+  const handleFileChange = (event: ChangeEvent<HTMLInputElement>) => chooseFile(event.target.files?.[0]);
+
+  const handleDrop = (event: DragEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    setIsDragging(false);
+    chooseFile(event.dataTransfer.files[0]);
   };
 
   const handleProcess = async () => {
     if (!file) return;
-
     setStatus("uploading");
     setError(null);
     setResults([]);
@@ -40,14 +57,9 @@ export default function Home() {
     try {
       const formData = new FormData();
       formData.append("file", file);
-
-      const uploadRes = await fetch("/api/upload", {
-        method: "POST",
-        body: formData,
-      });
+      const uploadRes = await fetch("/api/upload", { method: "POST", body: formData });
       const uploadData = await uploadRes.json();
-      if (!uploadRes.ok)
-        throw new Error(uploadData.error || "Failed to read PDF");
+      if (!uploadRes.ok) throw new Error(uploadData.error || "Could not read this PDF.");
 
       setStatus("extracting");
       const extractRes = await fetch("/api/extract", {
@@ -55,34 +67,25 @@ export default function Home() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ text: uploadData.text }),
       });
-      
       const extractData = await extractRes.json();
-      if (!extractRes.ok)
-        throw new Error(extractData.error || "Failed to extract claims");
-
-      // --- THE FIX: Ensure we always have a valid array ---
-      const claimsList = Array.isArray(extractData.claims)
-        ? extractData.claims
-        : [];
-      if (claimsList.length === 0)
-        throw new Error("No verifiable claims found in this document.");
+      if (!extractRes.ok) throw new Error(extractData.error || "Could not find claims.");
+      if (!Array.isArray(extractData.claims) || extractData.claims.length === 0) {
+        throw new Error("No verifiable claims were found in this document.");
+      }
 
       setStatus("verifying");
       const verifyRes = await fetch("/api/verify", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ claims: claimsList }),
+        body: JSON.stringify({ claims: extractData.claims }),
       });
-      // ----------------------------------------------------
       const verifyData = await verifyRes.json();
-      if (!verifyRes.ok)
-        throw new Error(verifyData.error || "Failed to verify claims");
-
-      setResults(verifyData.results);
+      if (!verifyRes.ok) throw new Error(verifyData.error || "Could not verify the claims.");
+      setResults(Array.isArray(verifyData.results) ? verifyData.results : []);
       setStatus("success");
-    } catch (err: any) {
-      console.error(err);
-      setError(err.message || "An unexpected error occurred.");
+    } catch (caughtError) {
+      console.error(caughtError);
+      setError(getErrorMessage(caughtError));
       setStatus("error");
     }
   };
@@ -96,217 +99,32 @@ export default function Home() {
   };
 
   const downloadCSV = () => {
-    const headers = ["Claim", "Category", "Status", "Reasoning"];
-    const escapeCsv = (val: string) => `"${String(val).replace(/"/g, '""')}"`;
-    const rows = results.map((r) => [
-      escapeCsv(r.claim),
-      escapeCsv(r.category),
-      escapeCsv(r.status || "Unverifiable"),
-      escapeCsv(r.reasoning || "No reasoning available."),
-    ]);
-    const csvContent = [
-      headers.join(","),
-      ...rows.map((r) => r.join(",")),
-    ].join("\n");
-    const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
-    const url = URL.createObjectURL(blob);
+    const escapeCsv = (value: string) => `"${value.replace(/"/g, '""')}"`;
+    const rows = results.map((result) => [escapeCsv(result.claim), escapeCsv(result.category), escapeCsv(result.status || "Unverifiable"), escapeCsv(result.reasoning || "No reasoning available.")]);
+    const csv = ["Claim,Category,Status,Reasoning", ...rows.map((row) => row.join(","))].join("\n");
+    const url = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
     const link = document.createElement("a");
     link.href = url;
-    link.download = `fact-check-report-${new Date().toISOString().split("T")[0]}.csv`;
+    link.download = `verity-report-${new Date().toISOString().split("T")[0]}.csv`;
     link.click();
+    URL.revokeObjectURL(url);
   };
 
-  const getStatusBadge = (status?: string) => {
-    switch (status) {
-      case "Verified":
-        return (
-          <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-green-100 text-green-800 border border-green-200">
-            ✅ Verified
-          </span>
-        );
-      case "False":
-        return (
-          <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-red-100 text-red-800 border border-red-200">
-            ❌ False
-          </span>
-        );
-      case "Inaccurate":
-        return (
-          <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-yellow-100 text-yellow-800 border border-yellow-200">
-            ⚠️ Inaccurate
-          </span>
-        );
-      default:
-        return (
-          <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-gray-100 text-gray-800 border border-gray-200">
-            ❓ Unverifiable
-          </span>
-        );
-    }
-  };
+  const activeStage = stages.findIndex((stage) => stage.key === status);
+  const isProcessing = ["uploading", "extracting", "verifying"].includes(status);
 
   return (
-    <main className="min-h-screen bg-gradient-to-b from-gray-50 to-white p-6 md:p-12">
-      <div className="max-w-5xl mx-auto">
-        {/* Header */}
-        <div className="text-center mb-10">
-          <h1 className="text-4xl md:text-5xl font-extrabold text-gray-900 tracking-tight mb-3">
-            🔍 AI Fact-Checker
-          </h1>
-          <p className="text-gray-600 text-lg max-w-2xl mx-auto">
-            Upload a PDF to extract statistics, dates, and technical facts. We
-            verify them against live web data in real-time.
-          </p>
-        </div>
-
-        {/* Upload Zone */}
-        {(status === "idle" || status === "error") && (
-          <div className="bg-white rounded-2xl shadow-lg border-2 border-dashed border-gray-300 p-12 text-center hover:border-blue-500 transition-colors">
-            <input
-              type="file"
-              accept="application/pdf"
-              onChange={handleFileChange}
-              ref={fileInputRef}
-              className="hidden"
-              id="pdf-upload"
-            />
-            <label htmlFor="pdf-upload" className="cursor-pointer block">
-              <div className="flex flex-col items-center">
-                <div className="w-16 h-16 bg-blue-50 rounded-xl flex items-center justify-center mb-4">
-                  <svg
-                    className="w-8 h-8 text-blue-600"
-                    fill="none"
-                    stroke="currentColor"
-                    viewBox="0 0 24 24"
-                  >
-                    <path
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      strokeWidth={2}
-                      d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"
-                    />
-                  </svg>
-                </div>
-                <span className="text-lg font-semibold text-gray-800">
-                  {file ? file.name : "Drop your PDF here or click to browse"}
-                </span>
-                <span className="text-sm text-gray-500 mt-1">
-                  Supports PDF files up to 10MB
-                </span>
-              </div>
-            </label>
-
-            {/* Show Start Button when file is selected */}
-            {file && (
-              <button
-                onClick={handleProcess}
-                className="mt-6 px-8 py-3 bg-blue-600 text-white font-semibold rounded-xl hover:bg-blue-700 transition-all shadow-md hover:shadow-lg transform hover:-translate-y-0.5"
-              >
-                🔍 Start Fact-Checking
-              </button>
-            )}
-          </div>
-        )}
-
-        {/* Loading States */}
-        {status !== "idle" && status !== "error" && status !== "success" && (
-          <div className="bg-white rounded-2xl shadow-lg border border-gray-200 p-12 text-center mt-6">
-            <div className="animate-spin rounded-full h-12 w-12 border-4 border-blue-200 border-t-blue-600 mx-auto mb-5"></div>
-            <h3 className="text-xl font-bold text-gray-800 mb-2">
-              {status === "uploading" && "📄 Parsing PDF structure..."}
-              {status === "extracting" && "🧠 AI extracting key claims..."}
-              {status === "verifying" &&
-                "🌍 Cross-referencing with live web..."}
-            </h3>
-            <p className="text-gray-500">
-              {status === "verifying"
-                ? "This usually takes 10–30 seconds. Please keep this tab open."
-                : "Processing your document..."}
-            </p>
-          </div>
-        )}
-
-        {/* Results Dashboard */}
-        {status === "success" && results.length > 0 && (
-          <div className="mt-10 animate-in fade-in slide-in-from-bottom-4 duration-500">
-            <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 mb-6">
-              <h2 className="text-2xl font-bold text-gray-900">
-                📊 Fact-Check Results
-              </h2>
-              <div className="flex gap-3 w-full sm:w-auto">
-                <button
-                  onClick={downloadCSV}
-                  className="flex-1 sm:flex-none px-4 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-lg hover:bg-gray-50 transition flex items-center justify-center gap-2 shadow-sm"
-                >
-                  <svg
-                    className="w-4 h-4"
-                    fill="none"
-                    stroke="currentColor"
-                    viewBox="0 0 24 24"
-                  >
-                    <path
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      strokeWidth={2}
-                      d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"
-                    />
-                  </svg>
-                  Download CSV
-                </button>
-                <button
-                  onClick={handleReset}
-                  className="flex-1 sm:flex-none px-4 py-2 text-sm font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700 transition shadow-sm"
-                >
-                  Check New PDF
-                </button>
-              </div>
-            </div>
-
-            <div className="bg-white rounded-2xl shadow-lg border border-gray-200 overflow-hidden">
-              <div className="overflow-x-auto">
-                <table className="min-w-full divide-y divide-gray-200">
-                  <thead className="bg-gray-50">
-                    <tr>
-                      <th className="px-6 py-4 text-left text-xs font-bold text-gray-500 uppercase tracking-wider w-1/3">
-                        Claim
-                      </th>
-                      <th className="px-6 py-4 text-left text-xs font-bold text-gray-500 uppercase tracking-wider">
-                        Category
-                      </th>
-                      <th className="px-6 py-4 text-left text-xs font-bold text-gray-500 uppercase tracking-wider">
-                        Status
-                      </th>
-                      <th className="px-6 py-4 text-left text-xs font-bold text-gray-500 uppercase tracking-wider w-2/5">
-                        AI Reasoning
-                      </th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-gray-100">
-                    {results.map((item, index) => (
-                      <tr
-                        key={index}
-                        className="hover:bg-gray-50 transition-colors"
-                      >
-                        <td className="px-6 py-4 text-sm text-gray-900 font-medium align-top whitespace-pre-line break-words">
-                          {item.claim}
-                        </td>
-                        <td className="px-6 py-4 text-sm text-gray-600 capitalize align-top">
-                          {item.category.replace("_", " ")}
-                        </td>
-                        <td className="px-6 py-4 align-top">
-                          {getStatusBadge(item.status)}
-                        </td>
-                        <td className="px-6 py-4 text-sm text-gray-600 align-top whitespace-pre-line break-words max-w-md">
-                          {item.reasoning || "No reasoning provided."}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          </div>
-        )}
+    <main className="site-shell">
+      <nav className="topbar"><a className="brand" href="#top" aria-label="Verity home"><span className="brand-mark">V</span><span>verity</span></a><div className="nav-meta"><span className="live-dot" /> Live evidence desk <span className="nav-divider" /> v1.0</div></nav>
+      <div className="page-content" id="top">
+        <section className="intro-grid"><div className="intro-copy"><p className="eyebrow">Document intelligence / 01</p><h1>Make every claim<br /><em>earn its place.</em></h1><p className="lede">Drop in a research paper, report, or briefing. Verity finds the statements that matter, then checks each one against current web evidence.</p><div className="signal-row"><span className="signal-line" /><span>PDF to proof, in one pass</span></div></div><div className="architecture-note"><span className="note-number">01</span><p>Built for the moment<br /><strong>before you hit publish.</strong></p><div className="note-rule" /><span className="note-caption">Groq reasoning + live search</span></div></section>
+        <section className="workspace" aria-label="Fact-check workspace"><div className="workspace-head"><div><p className="section-kicker">Start a review</p><h2>Bring a document into focus.</h2></div><span className="step-count">01 <i /> 03</span></div>
+          {(status === "idle" || status === "error") && <div className={`dropzone ${isDragging ? "is-dragging" : ""}`} onDragOver={(event) => { event.preventDefault(); setIsDragging(true); }} onDragLeave={() => setIsDragging(false)} onDrop={handleDrop}><input ref={fileInputRef} id="pdf-upload" type="file" accept="application/pdf" onChange={handleFileChange} /><label htmlFor="pdf-upload" className="dropzone-label"><span className="upload-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 16V4m0 0L7.5 8.5M12 4l4.5 4.5M5 14v4a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-4" /></svg></span><span className="drop-title">{file ? file.name : "Drop your PDF here"}</span><span className="drop-subtitle">or <u>browse your files</u> · PDF up to 10MB</span></label>{file && <button className="primary-button" onClick={handleProcess}>Run fact-check <span>↗</span></button>}</div>}
+          {isProcessing && <div className="processing-panel"><div className="processing-top"><span className="processing-pulse" /> Working through <strong>{file?.name}</strong></div><div className="progress-track"><span style={{ width: `${Math.max(18, (activeStage + 1) * 33.33)}%` }} /></div><div className="stage-list">{stages.map((stage, index) => <div className={`stage ${index <= activeStage ? "stage-active" : ""}`} key={stage.key}><span>{index < activeStage ? "✓" : `0${index + 1}`}</span>{stage.label}</div>)}</div><p className="processing-note">{status === "verifying" ? "Comparing claims with live search results. This can take a moment." : "Reading the structure and meaning of your document."}</p></div>}
+          {error && <div className="error-message" role="alert"><span>!</span>{error}</div>}
+        </section>
+        {status === "success" && <section className="results-section"><div className="results-head"><div><p className="section-kicker">Review complete</p><h2>Evidence, organized.</h2></div><div className="result-actions"><button className="text-button" onClick={downloadCSV}>↓ Export CSV</button><button className="dark-button" onClick={handleReset}>Check another <span>↗</span></button></div></div><div className="result-summary"><span className="summary-number">{results.length}</span><span>claims reviewed from <strong>{file?.name}</strong></span><span className="summary-spacer" /><span className="verified-key" /><span>Verified</span><span className="uncertain-key" /><span>Needs context</span></div><div className="results-list">{results.map((item, index) => <article className="result-row" key={`${item.claim}-${index}`}><span className="result-index">{String(index + 1).padStart(2, "0")}</span><div className="result-claim"><p className="category-label">{item.category.replaceAll("_", " ")}</p><h3>{item.claim}</h3></div><div className={`status-badge status-${(item.status || "Unverifiable").toLowerCase()}`}><span />{item.status || "Unverifiable"}</div><p className="reasoning">{item.reasoning || "No reasoning provided."}</p></article>)}</div></section>}
+        <footer className="footer"><span>VERITY / FACT-CHECKING WORKSPACE</span><span>Private by design · Your document is processed on request</span></footer>
       </div>
     </main>
   );
