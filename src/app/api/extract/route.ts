@@ -1,12 +1,19 @@
 import { NextRequest, NextResponse } from 'next/server';
 import Groq from 'groq-sdk';
 
-const groq = new Groq({
-  apiKey: process.env.GROQ_API_KEY,
-});
+const GROQ_MODEL = process.env.GROQ_MODEL || 'openai/gpt-oss-120b';
+
+function getGroqClient() {
+  const apiKey = process.env.GROQ_API_KEY;
+  if (!apiKey) {
+    throw new Error('GROQ_API_KEY is not configured');
+  }
+  return new Groq({ apiKey });
+}
 
 export async function POST(req: NextRequest) {
   try {
+    const groq = getGroqClient();
     const body = await req.json();
     const { text } = body;
 
@@ -44,7 +51,7 @@ export async function POST(req: NextRequest) {
           content: truncatedText
         }
       ],
-      model: "llama-3.3-70b-versatile", 
+      model: GROQ_MODEL,
       temperature: 0.1, 
       response_format: { type: "json_object" } 
     });
@@ -53,7 +60,7 @@ export async function POST(req: NextRequest) {
     const cleanJson = responseContent.replace(/```json/g, '').replace(/```/g, '').trim();
     
     // --- THE FIX: Smart JSON Unwrapping ---
-    let parsed = JSON.parse(cleanJson);
+    const parsed = JSON.parse(cleanJson);
     let claims = [];
     
     if (Array.isArray(parsed)) {
@@ -75,6 +82,18 @@ export async function POST(req: NextRequest) {
 
   } catch (error) {
     console.error('Claim Extraction Error:', error);
+    if (error instanceof Error && error.message.includes('model')) {
+      return NextResponse.json(
+        { error: `Groq model is unavailable. Check GROQ_MODEL in .env.local (currently ${GROQ_MODEL}).` },
+        { status: 502 }
+      );
+    }
+    if (error instanceof Error && error.message.includes('GROQ_API_KEY is not configured')) {
+      return NextResponse.json(
+        { error: 'GROQ_API_KEY is missing. Add it to the project root .env.local file and restart the dev server.' },
+        { status: 503 }
+      );
+    }
     return NextResponse.json(
       { error: 'Failed to extract claims from text' },
       { status: 500 }

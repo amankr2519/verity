@@ -4,6 +4,8 @@ import * as mupdf from 'mupdf';
 // Force Node.js runtime (mupdf uses native bindings, not Edge compatible)
 export const runtime = 'nodejs';
 
+const MAX_FILE_SIZE = 10 * 1024 * 1024;
+
 export async function POST(req: NextRequest) {
   try {
     // 1. Parse the incoming form data
@@ -17,6 +19,10 @@ export async function POST(req: NextRequest) {
 
     if (file.type !== 'application/pdf') {
       return NextResponse.json({ error: 'Only PDF files are allowed' }, { status: 400 });
+    }
+
+    if (file.size > MAX_FILE_SIZE) {
+      return NextResponse.json({ error: 'PDF files must be 10MB or smaller' }, { status: 413 });
     }
 
     // 3. Convert the file to a Uint8Array (required by mupdf)
@@ -33,6 +39,13 @@ export async function POST(req: NextRequest) {
       const page = doc.loadPage(i);
       const textPage = page.toStructuredText('preserve-whitespace');
       fullText += textPage.asText() + '\n\n';
+    }
+
+    if (!fullText.trim()) {
+      return NextResponse.json(
+        { error: 'This PDF does not contain selectable text to fact-check' },
+        { status: 422 }
+      );
     }
 
     // 6. Return the extracted text and metadata
